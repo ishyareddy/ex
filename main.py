@@ -1,118 +1,133 @@
-import os
 import cv2
+import os
 import json
+import time
 import pandas as pd
 from datetime import datetime
-from movement_analyser import extract_movement_sequence
-from feedback_manager import FeedbackManager
-from utils import select_roi, extract_clip
-from scipy.spatial.distance import cosine
-import numpy as np
+from detector import Detector
+from layout_matcher import LayoutChecker
 
-REF_VIDEO = "ref2.avi"
-TEST_VIDEO = "test3.avi"
-MEMORY_FILE = "memory/pattern_memory.json"
+VIDEO_PATH = "data/pcb_check_simulation.avi"
+REF_IMG_PATH = "data/ref_img.png"
+LAYOUT_PATH = "config/layout.json"
+MEMORY_FILE = "data/deviation_memory.json"
 LOG_FILE = "logs/deviation_log.xlsx"
-CLIP_DIR = "clips"
+PREVIEW_DIR = "previews"
+CLIP_DURATION_SEC = 2  # Save 2 seconds before & after deviation
+
+os.makedirs(PREVIEW_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+# Load memory
+if os.path.exists(MEMORY_FILE):
+    with open(MEMORY_FILE, "r") as f:
+        deviation_memory = json.load(f)
+else:
+    deviation_memory = {}
+
+log_records = []
+
+def draw_detections(frame, detections, check_result):
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        label = det["label"]
+        color = (0, 255, 0) if check_result["details"].get(label) == "present" else (0, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    status_text = f"Status: {check_result['status']}"
+    missing_text = ", ".join(check_result["missing"]) if check_result["status"] == "missing" else "No Missing Components"
+    cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    cv2.putText(frame, missing_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+def save_clip(buffer, timestamp_str, missing):
+    out_path = os.path.join(PREVIEW_DIR, f"deviation_{timestamp_str}.mp4")
+    height, width = buffer[0].shape[:2]
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+    for frame in buffer:
+        out.write(frame)
+    out.release()
+    print(f"Saved deviation preview: {out_path}")
+    return out_path
+
+def log_event(timestamp, status, missing, preview_path):
+    log_records.append({
+        "timestamp": timestamp,
+        "status": status,
+        "missing_components": ", ".join(missing),
+        "preview_clip": preview_path
+    })
 
 def main():
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("memory", exist_ok=True)
-    os.makedirs(CLIP_DIR, exist_ok=True)
+    detector = Detector(ref_img_path=REF_IMG_PATH, annotations_path=LAYOUT_PATH)
+    layout_checker = LayoutChecker(LAYOUT_PATH)
 
-    print("Select a ROI and then press SPACE or ENTER button!")
-    print("Cancel the selection process by pressing c button!")
+    ref_img = cv2.imread(REF_IMG_PATH)
+    if ref_img is None:
+        print("Error: Could not load reference image.")
+        return
+    ref_height, ref_width = ref_img.shape[:2]
 
-    roi = select_roi(TEST_VIDEO)
+    print("Reference layout:", list(layout_checker.reference_layout.keys()))
 
-    # Extract reference pattern
-    ref_angles, fps = extract_movement_sequence(REF_VIDEO, roi)
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return
 
-    feedback = FeedbackManager(MEMORY_FILE)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    buffer = []
+    max_buffer_len = int(fps * CLIP_DURATION_SEC)
+    frame_index = 0
 
-    # Load previous logs if exists
-    if os.path.exists(LOG_FILE):
-        log_df = pd.read_excel(LOG_FILE)
-        log = log_df.to_dict(orient='records')
-    else:
-        log = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("End of video or failed to grab frame.")
+            break
 
-    # Extract test video movement patterns
-    test_angles, _ = extract_movement_sequence(TEST_VIDEO, roi)
+        frame_resized = cv2.resize(frame, (ref_width, ref_height))
+        buffer.append(frame_resized.copy())
+        if len(buffer) > max_buffer_len:
+            buffer.pop(0)
 
-    # Segment into cycles based on reference pattern length
-    total_frames = len(test_angles)
-    cycle_length = len(ref_angles)
-    cycles = total_frames // cycle_length
-    step = cycle_length
+        detections = detector.detect(frame_resized)
+        check_result = layout_checker.check(detections)
+        missing_key = "_".join(sorted(check_result["missing"]))
 
-    print(f"🔷 Total test video frames: {total_frames}")
-    print(f"🟩 Total detected cycles: {cycles}")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
+        if check_result["status"] == "missing" and missing_key not in deviation_memory:
+            # Save clip
+            preview_path = save_clip(buffer, timestamp, check_result["missing"])
+            deviation_memory[missing_key] = {
+                "timestamp": timestamp,
+                "components": check_result["missing"]
+            }
+            log_event(timestamp, check_result["status"], check_result["missing"], preview_path)
+        elif check_result["status"] == "missing":
+            print("Repeated deviation detected. Skipping clip save.")
+            log_event(timestamp, "repeated", check_result["missing"], "already seen")
 
-    for i in range(cycles):
-        start = i * step
-        end = (i + 1) * step
-        angles = test_angles[start:end]
+        draw_detections(frame_resized, detections, check_result)
+        cv2.imshow("PCB Component Check", frame_resized)
 
-        test = np.array(angles)
-        min_len = min(len(angles), len(ref_angles))
-        test = np.array(angles[:min_len])
-        ref = np.array(ref_angles[:min_len])
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-        distance = cosine(test, ref) if len(test) > 1 else 1.0
-        print(f"Cycle {i+1}: similarity distance → {distance:.4f}")
+        frame_index += 1
 
-        timestamp = datetime.now().isoformat()
-        cycle_id = i + 1
-        clip_filename = f"cycle_{cycle_id}_{datetime.now().strftime('%Y%m%dT%H%M%S')}.mp4"
-        clip_path = os.path.join(CLIP_DIR, clip_filename)
+    cap.release()
+    cv2.destroyAllWindows()
 
-        # ✅ Auto-accept if identical or very close to reference
-        if distance < feedback.similarity_threshold:
-            print(f"✅ Cycle {cycle_id} auto-accepted (close to reference)")
-            feedback.add_normal(angles)
-            continue
+    # Save memory
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(deviation_memory, f, indent=2)
 
-        # Memory checks using similarity
-        if feedback.is_known_normal(angles):
-            print(f"✅ Cycle {cycle_id} auto-accepted (known normal)")
-            continue
-        elif feedback.is_known_deviation(angles):
-            print(f"❌ Cycle {cycle_id} auto-flagged (known deviation)")
-            print(f"ℹ️ Previously confirmed deviation — logging without asking.")
-            extract_clip(TEST_VIDEO, start, end, roi, clip_path, fps)
-            log.append({"cycle": cycle_id, "status": "Deviation", "timestamp": timestamp, "clip": clip_filename})
-            continue
-
-        # Unknown → ask user after preview
-        extract_clip(TEST_VIDEO, start, end, roi, clip_path, fps)
-
-        cap_preview = cv2.VideoCapture(clip_path)
-        while cap_preview.isOpened():
-            ret, frame = cap_preview.read()
-            if not ret:
-                break
-            cv2.imshow(f"Preview: Cycle {cycle_id}", frame)
-            if cv2.waitKey(int(1000 // fps)) & 0xFF == ord('q'):
-                break
-        cap_preview.release()
-        cv2.destroyWindow(f"Preview: Cycle {cycle_id}")
-
-        response = input(f"Is this a valid deviation? (y/n): ").strip().lower()
-        if response == "y":
-            feedback.add_deviation(angles)
-            print("✅ Deviation logged.")
-            log.append({"cycle": cycle_id, "status": "Deviation", "timestamp": timestamp, "clip": clip_filename})
-        else:
-            feedback.add_normal(angles)
-            print("ℹ️ Pattern added to memory as known-normal.")
-            # (normal not logged anymore as per last requirement)
-
-    # Save cumulative logs and memory
-    pd.DataFrame(log).to_excel(LOG_FILE, index=False)
-    feedback.save_memory()
-    print(f"📝 Log updated in {LOG_FILE}")
+    # Save Excel log
+    df = pd.DataFrame(log_records)
+    df.to_excel(LOG_FILE, index=False)
+    print(f"Log saved to {LOG_FILE}")
 
 if __name__ == "__main__":
     main()
