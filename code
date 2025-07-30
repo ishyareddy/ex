@@ -1,0 +1,105 @@
+# 📦 Install dependencies
+!pip install opencv-python-headless dtw tensorflow matplotlib tqdm --quiet
+
+# 📥 Imports
+import cv2, os, numpy as np
+from dtw import dtw
+from tqdm import tqdm
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
+
+# ⚙️ Config
+FRAME_SIZE = (224, 224)
+STRIDE = 1
+CYCLE_STRIDE = 10
+OUTPUT_DIR = "deviation_cycles1"
+model = MobileNetV2(include_top=False, weights='imagenet', pooling='avg')
+
+# 📽 Load video
+def load_video_frames(path):
+    cap = cv2.VideoCapture(path)
+    frames = []
+    while True:
+        ret, f = cap.read()
+        if not ret: break
+        frames.append(f)
+    cap.release()
+    return frames
+
+# 🔍 Extract features
+def extract_features_from_frames(frames):
+    features = []
+    for i, frame in enumerate(frames):
+        if i % STRIDE != 0: continue
+        frame = cv2.resize(frame, FRAME_SIZE)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = preprocess_input(img_to_array(frame))
+        features.append(frame)
+    features = np.array(features)
+    return model.predict(features, verbose=0)
+
+# 📏 DTW
+def compute_dtw_distance(ref_feat, test_feat):
+    dist, _, _, _ = dtw(ref_feat, test_feat, dist=lambda x, y: np.linalg.norm(x - y))
+    return dist
+
+# 🔗 Group overlaps
+def group_overlapping(dets):
+    dets.sort()
+    grouped, cur = [], None
+    for start, end, dist in dets:
+        if cur is None: cur = (start, end, dist)
+        elif start <= cur[1]:
+            cur = (cur[0], max(cur[1], end), max(cur[2], dist))
+        else:
+            grouped.append(cur)
+            cur = (start, end, dist)
+    if cur: grouped.append(cur)
+    return grouped
+
+# 💾 Save video clip
+def save_clip(frames, start, end, idx):
+    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+    out = cv2.VideoWriter(f"{OUTPUT_DIR}/deviation_{idx}.avi", cv2.VideoWriter_fourcc(*'XVID'), 20, (frames[0].shape[1], frames[0].shape[0]))
+    for i in range(start, min(end, len(frames))):
+        out.write(frames[i])
+    out.release()
+
+# 🚀 Main pipeline
+def run_deviation_detection(ref_path, test_path):
+    print(f"📥 Loading reference video...")
+    ref_frames = load_video_frames(ref_path)
+    ref_feat = extract_features_from_frames(ref_frames)
+    cycle_len = len(ref_feat)
+
+    print(f"📥 Loading test video...")
+    test_frames = load_video_frames(test_path)
+    test_feat = extract_features_from_frames(test_frames)
+
+    print(f"🔍 Scanning test video for deviating cycles...")
+    distances, locations = [], []
+    for i in tqdm(range(0, len(test_feat) - cycle_len, CYCLE_STRIDE)):
+        win = test_feat[i:i + cycle_len]
+        if len(win) != cycle_len: continue
+        dist = compute_dtw_distance(ref_feat, win)
+        distances.append(dist)
+        locations.append((i, i + cycle_len, dist))
+
+    distances = np.array(distances)
+    threshold = distances.mean() + distances.std()
+    print(f"📈 DTW Threshold = {threshold:.2f} (mean + 1×std)")
+
+    deviations = [loc for loc in locations if loc[2] > threshold]
+    grouped = group_overlapping(deviations)
+
+    print(f"🎬 Saving deviating cycles...")
+    for idx, (start, end, dist) in enumerate(grouped):
+        save_clip(test_frames, start * STRIDE, end * STRIDE, idx)
+        print(f"[SAVED] Deviation {idx}: frames {start}-{end} | DTW = {dist:.2f}")
+    print(f"🚨 Total {len(grouped)} deviation(s) saved in '{OUTPUT_DIR}'")
+
+# 🔧 Change paths if needed
+run_deviation_detection("/content/reference.avi", "/content/test.avi")
+
+https://chatgpt.com/share/688a3dd4-ba10-8008-81f1-9f8b1c599efe
